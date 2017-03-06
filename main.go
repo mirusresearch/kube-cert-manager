@@ -55,6 +55,7 @@ func main() {
 		class            string
 		defaultProvider  string
 		defaultEmail     string
+		defaultGracePeriod     string
 	)
 
 	flag.StringVar(&acmeURL, "acme-url", "", "The URL to the acme directory to use")
@@ -67,6 +68,7 @@ func main() {
 	flag.StringVar(&class, "class", "default", "Class label for resources managed by this certificate manager")
 	flag.StringVar(&defaultProvider, "default-provider", "", "Default handler to handle ACME challenges")
 	flag.StringVar(&defaultEmail, "default-email", "", "Default email address for ACME registrations")
+	flag.StringVar(&defaultGracePeriod, "default-grace-period", "0s", "delay the deletion of a cert by this many seconds")
 	flag.Parse()
 
 	if acmeURL == "" {
@@ -101,7 +103,7 @@ func main() {
 	log.Println("Starting Kubernetes Certificate Controller...")
 
 	// Create the processor
-	p := NewCertProcessor(acmeURL, certSecretPrefix, certNamespace, tagPrefix, namespaces, class, defaultProvider, defaultEmail, db)
+	p := NewCertProcessor(acmeURL, certSecretPrefix, certNamespace, tagPrefix, namespaces, class, defaultProvider, defaultEmail, defaultGracePeriod, db)
 
 	// Asynchronously start watching and refreshing certs
 	wg := sync.WaitGroup{}

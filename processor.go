@@ -48,18 +48,19 @@ import (
 
 // CertProcessor holds the shared configuration, state, and locks
 type CertProcessor struct {
-	acmeURL          string
-	certSecretPrefix string
-	certNamespace    string
-	tagPrefix        string
-	namespaces       []string
-	class            string
-	defaultProvider  string
-	defaultEmail     string
-	db               *bolt.DB
-	Lock             sync.Mutex
-	HTTPLock         sync.Mutex
-	TLSLock          sync.Mutex
+	acmeURL            string
+	certSecretPrefix   string
+	certNamespace      string
+	tagPrefix          string
+	namespaces         []string
+	class              string
+	defaultProvider    string
+	defaultEmail       string
+	defaultGracePeriod string
+	db                 *bolt.DB
+	Lock               sync.Mutex
+	HTTPLock           sync.Mutex
+	TLSLock            sync.Mutex
 }
 
 // NewCertProcessor creates and populates a CertProcessor
@@ -72,17 +73,19 @@ func NewCertProcessor(
 	class string,
 	defaultProvider string,
 	defaultEmail string,
+	defaultGracePeriod string,
 	db *bolt.DB) *CertProcessor {
 	return &CertProcessor{
-		acmeURL:          acmeURL,
-		certSecretPrefix: certSecretPrefix,
-		certNamespace:    certNamespace,
-		tagPrefix:        tagPrefix,
-		namespaces:       namespaces,
-		class:            class,
-		defaultProvider:  defaultProvider,
-		defaultEmail:     defaultEmail,
-		db:               db,
+		acmeURL:            acmeURL,
+		certSecretPrefix:   certSecretPrefix,
+		certNamespace:      certNamespace,
+		tagPrefix:          tagPrefix,
+		namespaces:         namespaces,
+		class:              class,
+		defaultProvider:    defaultProvider,
+		defaultEmail:       defaultEmail,
+		defaultGracePeriod: defaultGracePeriod,
+		db:                 db,
 	}
 }
 
@@ -501,6 +504,9 @@ func (p *CertProcessor) processCertificate(cert Certificate) (processed bool, er
 	isUpdate := s != nil
 	s = acmeCert.ToSecret(p.tagPrefix, p.class)
 	s.Name = p.secretName(cert)
+	if val, ok := cert.ObjectMeta.Annotations[addTagPrefix(p.tagPrefix, "gracePeriod")]; ok {
+		s.ObjectMeta.Annotations[addTagPrefix(p.tagPrefix, "gracePeriod")] = cert.ObjectMeta.Annotations[addTagPrefix(p.tagPrefix, "gracePeriod")]
+	}
 
 	if isUpdate {
 		log.Printf("Updating secret %v in namespace %v for domain %v", s.Name, namespace, cert.Spec.Domain)
@@ -585,11 +591,34 @@ func (p *CertProcessor) gcSecrets() error {
 			continue
 		}
 		if usedSecrets[secret.Namespace+" "+secret.Name] {
+			if val, ok := secret.ObjectMeta.Annotations[addTagPrefix(p.tagPrefix, "deleteTime")]; ok {
+				// secret is used again, remove the old annotation
+				delete(secret.ObjectMeta.Annotations, addTagPrefix(p.tagPrefix, "deleteTime"))
+				if err := saveSecret(secret.Namespace, secret, true); err != nil {
+					return err
+				}
+			}
 			continue
 		}
-		log.Printf("Deleting unused secret %s in namespace %s", secret.Name, secret.Namespace)
-		if err := deleteSecret(secret.Namespace, secret.Name); err != nil {
-			return err
+
+		var deleteTime time.Time
+		if val, ok := secret.ObjectMeta.Annotations[addTagPrefix(p.tagPrefix, "deleteTime")]; ok {
+			deleteTime, _ = time.Parse(time.RFC3339, secret.ObjectMeta.Annotations[addTagPrefix(p.tagPrefix, "deleteTime")])
+		} else {
+			gracePeriod := valueOrDefault(ingress.Annotations[addTagPrefix(p.tagPrefix, "gracePeriod")], p.gracePeriod)
+			deleteTime = time.Now().Add(time.ParseDuration(gracePeriod))
+		}
+
+		if time.Now().After(deleteTime) {
+			log.Printf("Deleting unused secret %s in namespace %s", secret.Name, secret.Namespace)
+			if err := deleteSecret(secret.Namespace, secret.Name); err != nil {
+				return err
+			}
+		} else {
+			secret.ObjectMeta.Annotations[addTagPrefix(p.tagPrefix, "deleteTime")] = deleteTime.format(time.RFC3339)
+			if err := saveSecret(secret.Namespace, secret, true); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -666,6 +695,7 @@ func (p *CertProcessor) processIngress(ingress v1beta1.Ingress) {
 			})
 			continue
 		}
+
 		cert := Certificate{
 			TypeMeta: unversioned.TypeMeta{
 				APIVersion: "v1",
@@ -681,6 +711,13 @@ func (p *CertProcessor) processIngress(ingress v1beta1.Ingress) {
 				SecretName: tls.SecretName,
 			},
 		}
+
+		if val, ok := ingress.Annotations[addTagPrefix(p.tagPrefix, "gracePeriod")]; ok {
+			cert.ObjectMeta["Annotations"] = map[string]string{
+				"stable.k8s.psg.io/kcm.gracePeriod": gracePeriod,
+			}
+		}
+
 		certs = append(certs, cert)
 	}
 	if len(certs) > 0 && (provider == "" || email == "") {
